@@ -2564,6 +2564,11 @@ async def _handle_sessions_send(
                 "The requested execution mode is unavailable.",
                 details={"reason": exc.code, **capability_report.to_payload()},
             ) from exc
+
+    def _cleanup_rejected_guest_profile() -> None:
+        if guest_profile is not None:
+            guest_profile.cleanup()
+
     if mode_resolution.effective_mode is not run_context.run_mode:
         accepted_run_mode_override = AcceptedRunModeOverride(
             run_mode=mode_resolution.effective_mode,
@@ -3226,6 +3231,7 @@ async def _handle_sessions_send(
             acceptance = await complete_durable_ingress(_commit_with_session_admission())
         except TaskQueueFullError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "QUEUE_FULL",
                 "The session task queue is full. Try again after queued work completes.",
@@ -3238,6 +3244,7 @@ async def _handle_sessions_send(
             ) from exc
         except StorageBusyError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "STORAGE_BUSY",
                 "Session storage is temporarily busy. Retry this send.",
@@ -3251,6 +3258,7 @@ async def _handle_sessions_send(
             ) from exc
         except StaleEpochError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "SESSION_CHANGED",
                 "The session changed while this turn was being accepted. Retry the send.",
@@ -3259,6 +3267,7 @@ async def _handle_sessions_send(
             ) from exc
         except TurnIngressConflictError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "IDEMPOTENCY_CONFLICT",
                 str(exc),
@@ -3267,9 +3276,11 @@ async def _handle_sessions_send(
             ) from exc
         except ProjectWorkspaceStateError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise _project_workspace_error(exc) from exc
         except TaskCollectionUnavailableError as exc:
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "COLLECT_RACE",
                 "The queued task started before this message could be collected. Retry it.",
@@ -3363,14 +3374,19 @@ async def _handle_sessions_send(
             ) from exc
         except sqlite3.IntegrityError as exc:
             if atomic_intent_plan.action != "create" or "sessions.session_key" not in str(exc):
+                _cleanup_rejected_guest_profile()
                 raise
             _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "SESSION_CONFLICT",
                 "Another request created this session first. Start a new chat and retry.",
                 retryable=False,
                 accepted=False,
             ) from exc
+        except BaseException:
+            _cleanup_rejected_guest_profile()
+            raise
 
         if not acceptance.replayed:
             notify_message_appended = getattr(ctx.session_manager, "notify_message_appended", None)
@@ -3869,7 +3885,8 @@ async def _handle_sessions_send(
             # path. The locked semantic mandates that any rejection /
             # rollback / queue-full leaves the uuid alive until TTL so
             # the user can retry against the same uuid.
-            _consumed_file_uuids = []  # noqa: F841 — explicit no-evict marker
+            _consumed_file_uuids = []  # noqa: F841 – explicit no-evict marker
+            _cleanup_rejected_guest_profile()
             from opensquilla.gateway.task_runtime import TaskQueueFullError
 
             if not isinstance(exc, TaskQueueFullError):

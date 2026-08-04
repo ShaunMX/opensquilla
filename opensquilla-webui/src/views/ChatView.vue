@@ -642,6 +642,7 @@ import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
+import { effectiveComposerRunMode } from '@/composables/chat/composerRunMode'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
@@ -923,7 +924,7 @@ async function refreshRunModePreference() {
   }
 }
 const activeRunModeLock = ref<SandboxRunMode | null>(null)
-const runMode = computed<SandboxRunMode>(
+const requestedRunMode = computed<SandboxRunMode>(
   () => activeRunModeLock.value ?? globalRunMode.value,
 )
 
@@ -933,7 +934,7 @@ const sandboxSetupRecovery = useSandboxSetupRecovery({
       rpc.call(method, params, sandboxSetupRpcCallOptions),
   },
   connectionState: computed(() => rpc.state),
-  runMode,
+  runMode: requestedRunMode,
   autoRefresh: false,
   onUnavailable: async (status) => {
     await platform.settings.reportSandboxUnavailable?.({
@@ -945,6 +946,11 @@ const sandboxSetupRecovery = useSandboxSetupRecovery({
 const {
   status: sandboxSetupStatus,
 } = sandboxSetupRecovery
+const runMode = computed<SandboxRunMode>(() => effectiveComposerRunMode(
+  globalRunMode.value,
+  sandboxSetupStatus.value,
+  activeRunModeLock.value,
+))
 const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
   const status = sandboxSetupStatus.value
   if (

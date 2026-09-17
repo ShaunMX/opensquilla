@@ -4,7 +4,10 @@ import type {
   ChatToolCallRenderItem,
 } from '@/types/chat'
 import type { ChatPart, StatusPart } from '@/types/parts'
-import { compactionSkippedLabelCode } from '@/utils/chat/compactionStatus'
+import {
+  compactionCompletedLabelCode,
+  compactionSkippedLabelCode,
+} from '@/utils/chat/compactionStatus'
 
 type TextPart = Extract<ChatPart, { type: 'text' }>
 
@@ -116,9 +119,12 @@ export type AssistantActivityStatusCode =
   | 'chat.activity.provider.rateLimited'
   | 'chat.activity.provider.retryWait'
   | 'chat.activity.provider.retrying'
+  | 'chat.activity.provider.retryingWithoutLimit'
   | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
+  | 'chat.compact.summarySaved'
+  | 'chat.compact.temporarilyReduced'
   | 'chat.compact.withinBudget'
   | 'chat.compact.skipped'
   | 'chat.compact.cancelled'
@@ -196,6 +202,7 @@ export type AssistantAnswerSource =
   | 'canonical'
   | 'terminal-timeline-boundary'
   | 'terminal-control-boundary'
+  | 'explicit-no-answer'
   | 'none'
 
 export interface AssistantAnswerResolution {
@@ -246,12 +253,6 @@ const FILE_INSPECT_TOOLS = new Set([
   'list_directory',
   'glob_search',
   'grep_search',
-  'document_inspect',
-  'document_read',
-  'document_locate',
-  'document_browser_inspect',
-  'document_browser_screenshot',
-  'document_browser_reload',
 ])
 const FILE_CHANGE_TOOLS = new Set([
   'write_file',
@@ -261,10 +262,6 @@ const FILE_CHANGE_TOOLS = new Set([
   'edit_file',
   'edit_source',
   'apply_patch',
-  'document_apply',
-  'document_patch',
-  'document_browser_act',
-  'document_finish',
 ])
 const COMMAND_TOOLS = new Set([
   'exec',
@@ -552,7 +549,22 @@ function terminalTimelineAnswerCandidate(
   // preceding work narration inside Activity even when no tool separates it
   // from the final answer span.
   const boundaryItem = timeline[index]
-  const crossedPresentationBoundary = index >= 0
+  let semanticBoundaryIndex = index
+  let crossedPrecedingControl = false
+  while (
+    semanticBoundaryIndex >= 0
+    && isSuccessfulAnswerTransparentControlGroup(timeline[semanticBoundaryIndex]!)
+  ) {
+    crossedPrecedingControl = true
+    semanticBoundaryIndex -= 1
+  }
+  const semanticBoundaryItem = timeline[semanticBoundaryIndex]
+  const crossedPresentationBoundary = semanticBoundaryIndex >= 0
+    && semanticBoundaryItem?.type === 'text'
+    && semanticBoundaryItem.presentation === 'intermediate'
+  const crossedConfirmedControlBoundary = crossedPrecedingControl
+    && crossedPresentationBoundary
+  const crossedImmediatePresentationBoundary = index >= 0
     && boundaryItem?.type === 'text'
     && boundaryItem.presentation === 'intermediate'
   const crossedOrdinaryToolBoundary = index >= 0
@@ -561,7 +573,8 @@ function terminalTimelineAnswerCandidate(
   if (
     !crossedControlBoundary
     && !crossedOrdinaryToolBoundary
-    && !crossedPresentationBoundary
+    && !crossedImmediatePresentationBoundary
+    && !crossedConfirmedControlBoundary
   ) return null
 
   const compact = chunks.join('')
@@ -570,7 +583,7 @@ function terminalTimelineAnswerCandidate(
     compact,
     readable: readableTextAggregate(chunks),
     indexes,
-    source: crossedControlBoundary
+    source: crossedControlBoundary || crossedConfirmedControlBoundary
       ? 'terminal-control-boundary'
       : 'terminal-timeline-boundary',
   }
@@ -616,6 +629,30 @@ export function resolveAssistantAnswer(
         ? 'readable'
         : null
     : null
+  const textItems = timeline.filter(
+    (item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> =>
+      item.type === 'text',
+  )
+  const hasExplicitIntermediateOnly = textItems.length > 0
+    && textItems.every(item => item.presentation === 'intermediate')
+  const hasSemanticActivityBoundary = timeline.some(item => item.type === 'tool-group')
+    || Boolean(message.planRevisions?.length)
+  const allToolsSettledSuccessfully = timeline.every(item =>
+    item.type !== 'tool-group' || isSettledSuccessfulToolGroup(item),
+  )
+  const canUseExplicitNoAnswer = completedAnswerLifecycle(message, lifecycle)
+    && hasSemanticActivityBoundary
+    && hasExplicitIntermediateOnly
+    && allToolsSettledSuccessfully
+    && (matchedAggregate !== null || !canonical.trim())
+
+  if (canUseExplicitNoAnswer) {
+    return {
+      text: '',
+      source: 'explicit-no-answer',
+      activityItems: visibleTimeline,
+    }
+  }
   const canUseTerminalBoundary = completedAnswerLifecycle(message, lifecycle)
     && matchedAggregate !== null
     && candidate !== null
@@ -822,7 +859,7 @@ function statusLabelFor(
       return codeDescriptor('chat.compact.cancelled')
     }
     if (entry.state === 'running') return codeDescriptor('chat.compact.compacting')
-    return codeDescriptor('chat.compact.compacted')
+    return codeDescriptor(compactionCompletedLabelCode(entry.durability))
   }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
@@ -847,10 +884,11 @@ function statusLabelFor(
       })
     }
     if (phase === 'retrying') {
-      return codeDescriptor('chat.activity.provider.retrying', {
-        attempt: Math.max(0, Number.parseInt(first, 10) || 0),
-        limit: Math.max(0, Number.parseInt(second, 10) || 0),
-      })
+      const attempt = Math.max(0, Number.parseInt(first, 10) || 0)
+      const limit = Math.max(0, Number.parseInt(second, 10) || 0)
+      return limit > 0
+        ? codeDescriptor('chat.activity.provider.retrying', { attempt, limit })
+        : codeDescriptor('chat.activity.provider.retryingWithoutLimit', { attempt })
     }
     if (phase === 'fallback') return codeDescriptor('chat.activity.provider.fallback')
     return codeDescriptor('chat.activity.lifecycle.working')
@@ -966,10 +1004,9 @@ function isAutomaticCompletedMaintenance(step: AssistantActivityStatusStep): boo
 }
 
 /**
- * One automatic compaction may be observed through both a transient request
- * lifecycle and the durable history rewrite. When the backend uses different
- * ids for those adjacent terminal observations, present them as one maintenance
- * result. A failure or any intervening phase is a hard boundary.
+ * Adjacent automatic completions with the same durability can share one row.
+ * Temporary request reductions and saved summaries remain distinct outcomes.
+ * A failure or any intervening phase is a hard boundary.
  */
 function mergeAdjacentAutomaticCompletedMaintenance(
   steps: AssistantActivityStatusStep[],
@@ -982,17 +1019,8 @@ function mergeAdjacentAutomaticCompletedMaintenance(
       && isAutomaticCompletedMaintenance(previous)
       && isAutomaticCompletedMaintenance(step)
       && previous.id !== step.id
+      && previous.label.code === step.label.code
     ) {
-      const preferred = step.durability === 'durable' && previous.durability !== 'durable'
-        ? step
-        : previous
-      merged[merged.length - 1] = {
-        ...preferred,
-        // Preserve the first visual position and keyed DOM row while allowing
-        // durable metadata (including its id) to become authoritative.
-        key: previous.key,
-        at: previous.at,
-      }
       continue
     }
     merged.push(step)
@@ -1182,7 +1210,9 @@ export function projectAssistantActivity(
   const answerResolution = resolveAssistantAnswer(presentationMessage, timeline, lifecycle)
   const hasTimelineText = timeline.some(item => item.type === 'text')
   const hasCanonicalAnswer = Boolean(answerResolution.text.trim())
-  const canSeparateActivity = hasCanonicalAnswer || !hasTimelineText
+  const canSeparateActivity = hasCanonicalAnswer
+    || answerResolution.source === 'explicit-no-answer'
+    || !hasTimelineText
   const hasStructuralAnswerBoundary =
     answerResolution.source === 'terminal-control-boundary'
     || answerResolution.source === 'terminal-timeline-boundary'

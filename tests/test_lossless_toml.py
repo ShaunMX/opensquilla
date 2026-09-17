@@ -1,10 +1,9 @@
 """Contract tests for the comment-preserving TOML patcher.
 
-``patch_import_config`` runs on every Gateway boot (``lossless_patch_sandbox_fields``
-stamps ``sandbox.run_mode``), so a config it refuses to scan is a config the
-Gateway refuses to start on. The scanner is line-oriented, which makes values
-that span several physical lines — arrays of inline tables, nested arrays,
-triple-quoted strings — the interesting cases.
+The optional sandbox compatibility cleanup uses ``patch_import_config`` only
+when a released legacy RunMode field is present. The scanner is line-oriented,
+which makes values that span several physical lines — arrays of inline tables,
+nested arrays, triple-quoted strings — the interesting cases.
 """
 
 from __future__ import annotations
@@ -90,22 +89,20 @@ host = "127.0.0.1"
 def test_untouched_array_of_inline_tables_does_not_block_the_patch() -> None:
     """Regression for #1106.
 
-    The Control UI writes ``agents`` as a multi-line array of inline tables. The
-    boot migration only stamps ``sandbox.run_mode``, but the scan aborted on the
-    array's rows before reaching that edit, so the Gateway never started again.
+    The Control UI writes ``agents`` as a multi-line array of inline tables. An
+    older boot migration stamped ``sandbox.run_mode``, but the scan aborted on
+    the array's rows before reaching that edit.
     """
     patched = _patched(AGENTS_CONFIG, lambda payload: payload.update(port=18793))
     assert patched == AGENTS_CONFIG.decode("utf-8").replace("18792", "18793")
 
 
-def test_boot_migration_stamps_run_mode_next_to_an_agents_array() -> None:
+def test_boot_migration_leaves_agents_only_config_unchanged() -> None:
     from opensquilla.sandbox.upgrade_migration import lossless_patch_sandbox_fields
 
     patched, mode = lossless_patch_sandbox_fields(AGENTS_CONFIG)
-    payload = tomllib.loads(patched.decode("utf-8"))
-    assert payload["sandbox"]["run_mode"] == mode
-    assert payload["agents"] == [{"id": "qa-agent", "name": "QA Agent", "enabled": True}]
-    assert b'{ id = "qa-agent", name = "QA Agent", enabled = true },' in patched
+    assert patched == AGENTS_CONFIG
+    assert mode is None
 
 
 def test_nested_multi_line_array_rows_are_not_read_as_table_headers() -> None:
@@ -386,3 +383,140 @@ def test_source_bytes_must_match_the_validated_payload() -> None:
 def test_invalid_source_toml_is_rejected() -> None:
     with pytest.raises(LosslessTomlPatchError, match="not valid UTF-8 TOML"):
         patch_import_config(b"port = \n", {}, {"port": 1})
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("final_newline", [True, False])
+def test_removing_complete_multiline_array_preserves_comments_and_other_bytes(
+    newline: str, final_newline: bool,
+) -> None:
+    text = (
+        "# keep the header\n"
+        "[memory]\n"
+        "flush_triggers = [  # old policy\n"
+        '    "manual",  # explicit action\n'
+        "    # background action\n"
+        '    "idle#literal",\n'
+        "] # end policy\n"
+        "capture_assistant = true  # keep this setting\n"
+        "[other]\n"
+        'value = "unchanged"\n'
+    )
+    expected = (
+        "# keep the header\n"
+        "[memory]\n"
+        "# old policy\n"
+        "    # explicit action\n"
+        "    # background action\n"
+        "# end policy\n"
+        "capture_assistant = true  # keep this setting\n"
+        "[other]\n"
+        'value = "unchanged"\n'
+    )
+    if not final_newline:
+        text, expected = text[:-1], expected[:-1]
+    raw = text.replace("\n", newline).encode()
+    assert _patched(raw, lambda payload: payload["memory"].pop("flush_triggers")) == (
+        expected.replace("\n", newline)
+    )
+
+
+@pytest.mark.parametrize("value", ['["manual", "idle"]', "[]", "[\n]"])
+def test_complete_array_removal_also_handles_inline_and_empty_arrays(value: str) -> None:
+    raw = f'[memory]\nflush_triggers = {value}\ncapture_assistant = true\n'.encode()
+    assert _patched(raw, lambda payload: payload["memory"].pop("flush_triggers")) == (
+        "[memory]\ncapture_assistant = true\n"
+    )
+
+
+@pytest.mark.parametrize("delimiter", ['"""', "'''"])
+def test_removed_array_does_not_preserve_hashes_inside_multiline_strings(
+    delimiter: str,
+) -> None:
+    raw = (
+        "[memory]\n"
+        "flush_triggers = [\n"
+        f"    {delimiter}\n"
+        "# this is string content\n"
+        "[this is not a header]\n"
+        f"{delimiter}, # actual comment\n"
+        "]\n"
+        "capture_assistant = true\n"
+    ).encode()
+    assert _patched(raw, lambda payload: payload["memory"].pop("flush_triggers")) == (
+        "[memory]\n# actual comment\ncapture_assistant = true\n"
+    )
+
+
+def test_emptying_array_still_refuses_partial_value_rewrite() -> None:
+    message = _rejects(
+        b'[memory]\nflush_triggers = [\n  "manual",\n]\n',
+        lambda payload: payload["memory"].update(flush_triggers=[]),
+    )
+    assert "cannot remove ('memory', 'flush_triggers', 0)" in message
+
+
+def test_complete_array_removal_can_share_a_patch_with_scalar_updates_and_insertions() -> None:
+    raw = b'port = 1\nretired = [\n  "manual",\n]'
+
+    def transform(payload: dict) -> None:
+        payload.pop("retired")
+        payload.update(port=2, enabled=True)
+
+    assert _patched(raw, transform) == "port = 2\nenabled = true"
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("final_newline", [True, False])
+@pytest.mark.parametrize(
+    ("body", "expected_body", "comments"),
+    [
+        (
+            'flush_enabled = true, capture_assistant  =  true, flush_triggers = ["manual"]',
+            " capture_assistant  =  true",
+            "",
+        ),
+        (
+            'capture_assistant = true, "flush_triggers" = ["manual", "idle"], entry_ttl_days=0x15',
+            "capture_assistant = true, entry_ttl_days=0x15",
+            "",
+        ),
+        (
+            'embedding={model="quoted, } # value"}, repair_enabled=true',
+            'embedding={model="quoted, } # value"}',
+            "",
+        ),
+        ('flush_triggers=[], repair_enabled=true', "", ""),
+        (
+            'flush_enabled=true, cost.query_embedding_cache="off"',
+            ' cost.query_embedding_cache="off"',
+            "",
+        ),
+        (
+            'flush_triggers=[\n "manual", # removed value\n], capture_assistant=true',
+            ' capture_assistant=true',
+            " # removed value\n",
+        ),
+    ],
+)
+def test_retired_memory_fields_in_inline_table_keep_surviving_source_bytes(
+    body: str, expected_body: str, comments: str, newline: str, final_newline: bool,
+) -> None:
+    from opensquilla.gateway.config_migration import (
+        LATEST_CONFIG_VERSION,
+        migrate_config_payload,
+    )
+
+    prefix = f"config_version = {LATEST_CONFIG_VERSION}\n# preserve profile\n"
+    suffix = "}  # preserve settings comment\nport = 18795\n"
+    raw = (prefix + '"memory" = {' + body + suffix).replace("\n", newline).encode()
+    expected = (
+        prefix + comments + '"memory" = {' + expected_body + suffix
+    ).replace("\n", newline).encode()
+    if not final_newline:
+        raw, expected = raw[: -len(newline)], expected[: -len(newline)]
+    original = tomllib.loads(raw.decode())
+    transformed = migrate_config_payload(original, emit_diagnostics=False).payload
+    patched = patch_import_config(raw, original, transformed)
+    assert patched == expected
+    assert tomllib.loads(patched.decode()) == transformed

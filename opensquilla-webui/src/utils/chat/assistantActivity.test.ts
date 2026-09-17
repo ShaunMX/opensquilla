@@ -629,6 +629,61 @@ describe('projectAssistantActivity', () => {
     expect(projection.answerPart?.rawText).toBe(canonical)
   })
 
+  it('uses explicit intermediate presentation across a preceding transparent control', () => {
+    const canonical = 'Narration.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Narration.',
+            rawText: 'Narration.',
+            presentation: 'intermediate',
+          },
+          toolGroup([call('checkpoint', { name: 'plan_run_checkpoint' })], 'checkpoint'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-control-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual(['narration'])
+  })
+
+  it('keeps a terminal-tool turn with only explicit intermediate text out of the answer', () => {
+    const canonical = 'Work narration.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Work narration.',
+            rawText: 'Work narration.',
+            presentation: 'intermediate',
+          },
+          toolGroup([call('finish', { name: 'read_file' })], 'finish'),
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('explicit-no-answer')
+    expect(projection.answerPart).toBeNull()
+    expect(projection.activityItems.map(item => item.key)).toEqual(['narration', 'finish'])
+  })
+
   it.each([
     ['streaming', { isStreaming: true }, 'working' as const],
     ['terminal failure', { terminalFailure: true }, 'failed' as const],
@@ -1099,6 +1154,23 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('raw reasoning body')
   })
 
+  it.each(['working', 'settled'] as const)('localizes retries without a fixed limit when %s', (lifecycle) => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle,
+      statusHistory: [
+        { action: 'provider:retrying:7:0', label: 'Retrying 7/0', at: 1_000 },
+      ],
+    })
+
+    expect(projection.statusSteps[0]?.label).toEqual({
+      code: 'chat.activity.provider.retryingWithoutLimit', params: { attempt: 7 },
+    })
+    for (const locale of [en, zhHans, ja, de, fr, es]) {
+      expect(locale.chat.activity.provider.retryingWithoutLimit).toContain('{attempt}')
+      expect(locale.chat.activity.provider.retryingWithoutLimit).not.toContain('{limit}')
+    }
+  })
+
   it('derives each phase duration from the next transition and terminal boundary', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
@@ -1232,7 +1304,7 @@ describe('projectAssistantActivityTimeline', () => {
     expect(projection.statusSteps[0]?.label.code).toBe('chat.compact.skipped')
   })
 
-  it('merges adjacent automatic completions and keeps durable metadata', () => {
+  it('keeps request-scoped reductions distinct from adjacent saved summaries', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
       statusHistory: [
@@ -1259,13 +1331,20 @@ describe('projectAssistantActivityTimeline', () => {
       ],
     })
 
-    expect(projection.statusSteps).toHaveLength(1)
+    expect(projection.statusSteps).toHaveLength(2)
     expect(projection.statusSteps[0]).toMatchObject({
+      id: 'cmp-request-scoped',
+      state: 'completed',
+      isCurrent: false,
+      durability: 'request_scoped',
+      label: { code: 'chat.compact.temporarilyReduced' },
+    })
+    expect(projection.statusSteps[1]).toMatchObject({
       id: 'cmp-durable',
       state: 'completed',
       source: 'automatic',
       durability: 'durable',
-      label: { code: 'chat.compact.compacted' },
+      label: { code: 'chat.compact.summarySaved' },
     })
   })
 
